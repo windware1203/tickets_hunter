@@ -671,51 +671,72 @@ async def heartbeat_writer(filepath, loop_state):
         await asyncio.sleep(CONST_HEARTBEAT_INTERVAL_SEC)
 
 
-async def reload_config(config_dict, last_mtime, config_filepath):
+def config_file_version(file_stat):
+    return (file_stat.st_dev, file_stat.st_ino, file_stat.st_size,
+            file_stat.st_mtime_ns, file_stat.st_ctime_ns)
+
+
+def read_config_file(config_filepath):
+    with open(config_filepath, "r", encoding="utf-8") as json_data:
+        version = config_file_version(os.fstat(json_data.fileno()))
+        new_config = json.load(json_data)
+    # The pathname may have been replaced while the old handle was open.
+    if version != config_file_version(os.stat(config_filepath)):
+        return None, None
+    if not isinstance(new_config, dict):
+        raise ValueError("settings must be a JSON object")
+    if "advanced" in new_config and not isinstance(new_config["advanced"], dict):
+        raise ValueError("advanced settings must be a JSON object")
+    return new_config, version
+
+
+async def reload_config(config_dict, last_version, config_filepath):
     # Watch the config file this instance was actually launched with
     # (passing --input must not be overridden by edits to settings.json).
-    if not os.path.exists(config_filepath):
-        return config_dict, last_mtime
-
     try:
-        current_mtime = os.path.getmtime(config_filepath)
-        if current_mtime > last_mtime:
+        current_version = config_file_version(os.stat(config_filepath))
+        if current_version != last_version:
             await asyncio.sleep(0.1)
-            with open(config_filepath, 'r', encoding='utf-8') as json_data:
-                new_config = json.load(json_data)
+            # Keep settings application ordered with browser actions while disk I/O
+            # runs on a worker, leaving the CDP listener and heartbeat responsive.
+            new_config, loaded_version = await asyncio.to_thread(read_config_file, config_filepath)
+            if new_config is None:
+                return config_dict, last_version
 
-                # Update fields
-                fields = [
-                    "ticket_number", "date_auto_select", "area_auto_select", "keyword_exclude",
-                    "ocr_captcha", "tixcraft", "kktix", "cityline",
-                    "refresh_datetime", "contact", "date_auto_fallback", "area_auto_fallback"
+            # Update fields
+            fields = [
+                "ticket_number", "date_auto_select", "area_auto_select", "keyword_exclude",
+                "ocr_captcha", "tixcraft", "kktix", "cityline",
+                "refresh_datetime", "contact", "date_auto_fallback", "area_auto_fallback"
+            ]
+            for field in fields:
+                if field in new_config:
+                    config_dict[field] = new_config[field]
+
+            if "advanced" in new_config:
+                if "advanced" not in config_dict:
+                    config_dict["advanced"] = {}
+                adv_fields = [
+                    "play_sound", "disable_adjacent_seat", "hide_some_image",
+                    "auto_guess_options", "user_guess_string", "auto_reload_page_interval",
+                    "auto_reload_page_interval_range", "auto_reload_page_interval_max", "verbose",
+                    "tixcraft_soft_block_delay",
+                    "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
+                    "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
+                    "discount_code"
                 ]
-                for field in fields:
-                    if field in new_config:
-                        config_dict[field] = new_config[field]
+                for field in adv_fields:
+                    if field in new_config["advanced"]:
+                        config_dict["advanced"][field] = new_config["advanced"][field]
 
-                if "advanced" in new_config:
-                    if "advanced" not in config_dict:
-                        config_dict["advanced"] = {}
-                    adv_fields = [
-                        "play_sound", "disable_adjacent_seat", "hide_some_image",
-                        "auto_guess_options", "user_guess_string", "auto_reload_page_interval",
-                        "auto_reload_page_interval_range", "auto_reload_page_interval_max", "verbose",
-                        "tixcraft_soft_block_delay",
-                        "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
-                        "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
-                        "discount_code"
-                    ]
-                    for field in adv_fields:
-                        if field in new_config["advanced"]:
-                            config_dict["advanced"][field] = new_config["advanced"][field]
-
-                print("Configuration reloaded from " + os.path.basename(config_filepath))
-                return config_dict, current_mtime
-    except Exception as e:
+            print("Configuration reloaded from " + os.path.basename(config_filepath))
+            return config_dict, loaded_version
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, RecursionError) as e:
         print(f"[WARNING] Failed to reload config: {e}")
 
-    return config_dict, last_mtime
+    return config_dict, last_version
 
 async def main(args):
     # Derive instance id for multi-instance isolation:
@@ -733,6 +754,16 @@ async def main(args):
             print(f"[INSTANCE] Running as instance: {util.get_instance_id()}")
         else:
             print(f"[INSTANCE] Invalid instance id '{instance_id}' (allowed: [A-Za-z0-9_-], max 32 chars), fallback to default")
+
+    # Record the version before loading so edits during browser startup are seen.
+    app_root = util.get_app_root()
+    config_filepath = os.path.join(app_root, CONST_MAXBOT_CONFIG_FILE)
+    if args and getattr(args, "input", None):
+        config_filepath = args.input
+    try:
+        config_version = config_file_version(os.stat(config_filepath))
+    except OSError:
+        config_version = None
 
     config_dict = get_config_dict(args)
 
@@ -843,19 +874,10 @@ async def main(args):
     }
     ticketplus_purchase_done = False  # Guard: stop polling after purchase completed
 
-    # Initialize config mtime (hot-reload watches the file actually loaded)
-    app_root = util.get_app_root()
-    config_filepath = os.path.join(app_root, CONST_MAXBOT_CONFIG_FILE)
-    if args and getattr(args, "input", None):
-        config_filepath = args.input
-    config_mtime = 0
-    if os.path.exists(config_filepath):
-        config_mtime = os.path.getmtime(config_filepath)
-
     while True:
         await asyncio.sleep(0.05)
 
-        config_dict, config_mtime = await reload_config(config_dict, config_mtime, config_filepath)
+        config_dict, config_version = await reload_config(config_dict, config_version, config_filepath)
 
         # Phase 3: mark main-loop progress for the dashboard's busy check.
         loop_state["last_tick"] = time.time()
